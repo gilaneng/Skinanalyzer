@@ -10,6 +10,7 @@ NOTE: Scores are image-based heuristics for cosmetic consultation only.
 They are NOT a medical diagnosis.
 """
 
+import hashlib
 import io
 from dataclasses import dataclass
 from datetime import datetime
@@ -350,10 +351,11 @@ def forward_points(pts, box, strength):
 
 
 def draw_grid(img, box, cells):
+    """Grid spans exactly the box: top line = forehead, bottom line = chin."""
     x, y, w, h = box
     H, W = img.shape[:2]
-    gx0, gx1 = max(x - 0.2 * w, 0), min(x + 1.2 * w, W - 1)
-    gy0, gy1 = max(y - 0.1 * h, 0), min(y + 1.25 * h, H - 1)
+    gx0, gx1 = max(x, 0), min(x + w, W - 1)
+    gy0, gy1 = max(y, 0), min(y + h, H - 1)
     th = max(1, int(round(w / 220)))
     layer = img.copy()
     for xi in np.linspace(gx0, gx1, cells + 1):
@@ -586,14 +588,49 @@ def main():
     show_grid = k3.checkbox("Grid lines", value=True)
     show_shadow = k4.checkbox("Contour shadow", value=True)
 
-    b_img, a_img, pct = simulate_lift(rgb, result.face_box, strength / 100, show_grid, show_shadow, cells)
+    # --- Manual grid placement: forehead -> chin, left -> right -------------------
+    H, W = rgb.shape[:2]
+    fx, fy, fw, fh = result.face_box
+    key = hashlib.md5(file.getvalue()).hexdigest()[:8]
+
+    def _rng(lo, hi, default):
+        lo = int(max(lo, 0))
+        hi = int(max(hi, lo + 2))
+        return lo, hi, int(np.clip(default, lo, hi))
+
+    t_lo, t_hi, t_def = _rng(fy - 0.6 * fh, fy + 0.4 * fh, fy - 0.12 * fh)
+    b_lo, b_hi, b_def = _rng(fy + 0.6 * fh, min(fy + 1.6 * fh, H - 1), fy + fh)
+    l_lo, l_hi, l_def = _rng(fx - 0.5 * fw, fx + 0.5 * fw, fx)
+    r_lo, r_hi, r_def = _rng(fx + 0.5 * fw, min(fx + 1.5 * fw, W - 1), fx + fw)
+    keys = [f"top_{key}", f"bot_{key}", f"left_{key}", f"right_{key}"]
+
+    with st.expander("Adjust grid to your face (forehead to chin)", expanded=True):
+        st.caption("Move the top line to your hairline, the bottom line to your chin tip, "
+                   "and the side lines to the edges of your cheeks. The picture below updates live.")
+        g1, g2 = st.columns(2)
+        top = g1.slider("Forehead (top line)", t_lo, t_hi, t_def, key=keys[0])
+        bottom = g1.slider("Chin (bottom line)", b_lo, b_hi, b_def, key=keys[1])
+        left = g2.slider("Left edge", l_lo, l_hi, l_def, key=keys[2])
+        right = g2.slider("Right edge", r_lo, r_hi, r_def, key=keys[3])
+        if st.button("Reset grid position"):
+            for k in keys:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    if bottom - top < 60 or right - left < 60:
+        st.warning("Grid is too small – move the lines further apart. Using the detected face for now.")
+        box = (fx, fy, fw, fh)
+    else:
+        box = (int(left), int(top), int(right - left), int(bottom - top))
+
+    b_img, a_img, pct = simulate_lift(rgb, box, strength / 100, show_grid, show_shadow, cells)
     ic1, ic2 = st.columns(2)
     ic1.image(b_img, caption="Before – original grid and jawline (red)", use_container_width=True)
     ic2.image(a_img, caption="After – simulated lift: grid bends, green = new jawline, shaded = change",
               use_container_width=True)
     st.metric("Largest jawline movement", f"{pct:.1f}% of face height")
     st.caption("Illustrative simulation only – not a prediction or guarantee of any treatment result. "
-               "Contour is estimated from the detected face box, so a front-facing photo works best.")
+               "Contour is estimated from the grid box you set, so a front-facing photo works best.")
     lift = {"before": b_img, "after": a_img, "pct": pct, "strength": strength}
 
     pdf = build_pdf(result, recs, name, lift)
