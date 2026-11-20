@@ -62,7 +62,7 @@ PRODUCTS = {
     },
 }
 
-APP_VERSION = "2026-11-20 contour + score comparison"
+APP_VERSION = "2026-11-20 contour + score comparison (diagnostics)"
 CONCERN_THRESHOLD = 35  # score at/above which a concern is flagged
 
 
@@ -526,6 +526,10 @@ class LandmarkUnavailable(RuntimeError):
 
 
 def _model_path() -> str:
+    # A copy placed next to app.py (same folder in the repository) is used first
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
+    if os.path.exists(local) and os.path.getsize(local) > 1_000_000:
+        return local
     path = os.path.join(tempfile.gettempdir(), "face_landmarker.task")
     if not os.path.exists(path) or os.path.getsize(path) < 1_000_000:
         tmp = path + ".part"
@@ -556,7 +560,7 @@ def face_landmarks(rgb):
     try:
         kind, lm = _get_landmarker()
     except Exception as e:                      # missing library / no model / no network
-        raise LandmarkUnavailable(str(e))
+        raise LandmarkUnavailable(f"{type(e).__name__}: {e}")
     h, w = rgb.shape[:2]
     with _LOCK:
         if kind == "legacy":
@@ -1072,10 +1076,12 @@ def main():
         try:
             lm1 = face_landmarks(rgb)
             lm2 = face_landmarks(rgb2) if rgb2 is not None else None
-        except LandmarkUnavailable:
+        except LandmarkUnavailable as e:
             lm1 = lm2 = None
             st.warning("Face contour detection is not available on this server right now, so this section "
                        "is skipped. The skin analysis and report still work.")
+            with st.expander("Technical details (send this to your developer)"):
+                st.code(str(e)[:700] or "unknown error")
         else:
             if lm1 is None:
                 st.warning("No face contour could be detected in the 1st photo. Use a clear, front-facing photo.")
