@@ -62,6 +62,7 @@ PRODUCTS = {
     },
 }
 
+APP_VERSION = "2026-11-20 contour + score comparison"
 CONCERN_THRESHOLD = 35  # score at/above which a concern is flagged
 
 
@@ -988,6 +989,7 @@ def main():
 
     if not file:
         st.info("Add the 1st photo above to start the analysis.")
+        st.caption(f"Version: {APP_VERSION}")
         return
 
     if present:
@@ -1133,7 +1135,7 @@ def main():
                            file_name=f"skin_report_{datetime.now():%Y%m%d}.pdf",
                            mime="application/pdf", type="primary")
 
-    st.caption("Cosmetic analysis only. Not a medical diagnosis.")
+    st.caption(f"Cosmetic analysis only. Not a medical diagnosis. Version: {APP_VERSION}")
 
 
 if __name__ == "__main__":
