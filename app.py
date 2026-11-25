@@ -10,6 +10,7 @@ NOTE: Scores are image-based heuristics for cosmetic consultation only.
 They are NOT a medical diagnosis.
 """
 
+import base64
 import hashlib
 import html
 import io
@@ -62,7 +63,7 @@ PRODUCTS = {
     },
 }
 
-APP_VERSION = "2026-11-20 contour + score comparison (diagnostics)"
+APP_VERSION = "2026-11-25 draggable grid"
 CONCERN_THRESHOLD = 35  # score at/above which a concern is flagged
 
 
@@ -637,19 +638,23 @@ def smooth_closed(pts, n=8):
     return np.array(out, np.float32)
 
 
-def draw_grid(img, box, cells):
-    """Grid spans the face box: top line = forehead, bottom line = chin."""
-    x, y, w, h = box
-    H, W = img.shape[:2]
-    gx0, gx1 = max(x, 0), min(x + w, W - 1)
-    gy0, gy1 = max(y, 0), min(y + h, H - 1)
-    th = max(1, int(round(w / 260)))
+def apply_grid(img, xs, ys):
+    """Draw grid lines at fractional positions (xs across, ys down). The grid spans from the
+    first to the last line in each direction, so moving the outer lines resizes the grid."""
+    if not xs or not ys:
+        return img
+    h, w = img.shape[:2]
+    x0, x1 = int(min(xs) * w), int(max(xs) * w)
+    y0, y1 = int(min(ys) * h), int(max(ys) * h)
+    th = max(1, int(round(w / 380)))
     layer = img.copy()
-    for xi in np.linspace(gx0, gx1, cells + 1):
-        cv2.line(layer, (int(xi), int(gy0)), (int(xi), int(gy1)), (255, 255, 255), th, cv2.LINE_AA)
-    for yi in np.linspace(gy0, gy1, cells + 1):
-        cv2.line(layer, (int(gx0), int(yi)), (int(gx1), int(yi)), (255, 255, 255), th, cv2.LINE_AA)
-    return cv2.addWeighted(layer, 0.55, img, 0.45, 0)
+    for f in ys:
+        y = int(f * h)
+        cv2.line(layer, (x0, y), (x1, y), (255, 255, 255), th, cv2.LINE_AA)
+    for f in xs:
+        x = int(f * w)
+        cv2.line(layer, (x, y0), (x, y1), (255, 255, 255), th, cv2.LINE_AA)
+    return cv2.addWeighted(layer, 0.6, img, 0.4, 0)
 
 
 def draw_contour(img, pts, color, th):
@@ -657,11 +662,12 @@ def draw_contour(img, pts, color, th):
     cv2.polylines(img, [p.reshape(-1, 1, 2)], True, color, th, cv2.LINE_AA)
 
 
-def contour_views(rgb_b, lm_b, rgb_a=None, lm_a=None, show_grid=True, cells=12, show_diff=True):
+def contour_views(rgb_b, lm_b, rgb_a=None, lm_a=None, show_diff=True, cells=12):
     """
     Returns dict with 'before' (red contour), and when a 2nd photo is given:
     'after' (green contour, aligned to photo 1), 'overlay' (both + shaded difference), 'metrics'.
-    All images are cropped around the face of photo 1.
+    Images have no grid; 'grid' gives the automatic grid positions (fractions of the cropped image)
+    spanning forehead to chin and cheek to cheek. All images are cropped around the face of photo 1.
     """
     H, W = rgb_b.shape[:2]
     x0, y0 = lm_b[OVAL].min(axis=0)
@@ -669,8 +675,7 @@ def contour_views(rgb_b, lm_b, rgb_a=None, lm_a=None, show_grid=True, cells=12, 
     box = (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
     th = max(2, int(round(box[2] / 170)))
 
-    base = draw_grid(rgb_b, box, cells) if show_grid else rgb_b.copy()
-    before = base.copy()
+    before = rgb_b.copy()
     draw_contour(before, lm_b[OVAL], RED, th)
 
     mx, my = int(0.3 * box[2]), int(0.25 * box[3])
@@ -678,7 +683,10 @@ def contour_views(rgb_b, lm_b, rgb_a=None, lm_a=None, show_grid=True, cells=12, 
     cy0, cy1 = max(box[1] - my, 0), min(box[1] + box[3] + my, H)
     crop = lambda im: im[cy0:cy1, cx0:cx1]
 
-    out = {"before": crop(before), "metrics": None, "after": None, "overlay": None}
+    gx = (np.linspace(box[0], box[0] + box[2], cells + 1) - cx0) / max(cx1 - cx0, 1)
+    gy = (np.linspace(box[1], box[1] + box[3], cells + 1) - cy0) / max(cy1 - cy0, 1)
+    out = {"before": crop(before), "metrics": None, "after": None, "overlay": None,
+           "grid": {"xs": [round(float(v), 4) for v in gx], "ys": [round(float(v), 4) for v in gy]}}
     if rgb_a is None or lm_a is None:
         return out
     cmp_ = compare_faces(lm_b, lm_a)
@@ -686,7 +694,7 @@ def contour_views(rgb_b, lm_b, rgb_a=None, lm_a=None, show_grid=True, cells=12, 
         return out
     aligned_img = cv2.warpAffine(rgb_a, cmp_["M"], (W, H), flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_REFLECT)
-    after = draw_grid(aligned_img, box, cells) if show_grid else aligned_img.copy()
+    after = aligned_img.copy()
     draw_contour(after, cmp_["aligned"][OVAL], GREEN, th)
 
     overlay = rgb_b.copy()
@@ -702,6 +710,221 @@ def contour_views(rgb_b, lm_b, rgb_a=None, lm_a=None, show_grid=True, cells=12, 
 
     out.update(after=crop(after), overlay=crop(overlay), metrics=cmp_)
     return out
+
+
+# ----------------------------------------------------------------------------
+# Draggable grid (custom Streamlit component, written to a temp folder at start-up
+# so no extra files are needed in the repository)
+# ----------------------------------------------------------------------------
+GRID_HTML = r'''<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--ink:#14272E;--teal:#1B6B73;--line:#D9E2E4;--muted:#5C6F75}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:transparent;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
+#wrapper{padding:2px}
+#bar{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:0 0 10px;font-size:14px}
+#bar label{display:flex;align-items:center;gap:6px;cursor:pointer}
+#bar input{width:18px;height:18px;accent-color:var(--teal)}
+#bar button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:7px 14px;font-size:14px;cursor:pointer;color:var(--ink)}
+#hint{width:100%;color:var(--muted);font-size:13px}
+#panels{display:flex;flex-wrap:wrap;gap:12px}
+.panel{flex:1 1 280px;min-width:0}
+.cap{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.35}
+.wrap{position:relative;line-height:0}
+.wrap img{width:100%;height:auto;border-radius:12px;display:block;-webkit-user-select:none;user-select:none}
+.wrap canvas{position:absolute;left:0;top:0;width:100%;height:100%;border-radius:12px}
+</style></head><body>
+<div id="wrapper">
+<div id="bar">
+<label><input type="checkbox" id="sync" checked> Move both photos together</label>
+<label><input type="checkbox" id="moveall"> Move whole grid</label>
+<label><input type="checkbox" id="lock"> Lock grid</label>
+<button id="reset" type="button">Reset grid</button>
+<div id="hint">Drag a grid line to move it. Tick "Move whole grid" to shift all lines at once, or "Lock grid" to scroll freely.</div>
+</div>
+<div id="panels"></div>
+</div>
+<script>
+(function(){
+var S={uid:null,panels:[],init:null,drag:null,lastH:0};
+function $(id){return document.getElementById(id);}
+function send(type,data){var m={isStreamlitMessage:true,type:type};for(var k in data){m[k]=data[k];}window.parent.postMessage(m,"*");}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function gridPanels(){return S.panels.filter(function(p){return p.grid;});}
+function setHeight(){var h=Math.ceil($("wrapper").getBoundingClientRect().height)+4;if(Math.abs(h-S.lastH)>1){S.lastH=h;send("streamlit:setFrameHeight",{height:h});}}
+function locked(){return $("lock").checked;}
+function moveAll(){return $("moveall").checked;}
+function syncOn(){return $("sync").checked;}
+
+function draw(p){
+  if(!p.grid||!p.canvas)return;
+  var c=p.canvas,w=c.clientWidth,h=c.clientHeight;if(!w||!h)return;
+  var dpr=window.devicePixelRatio||1;
+  if(c.width!==Math.round(w*dpr)||c.height!==Math.round(h*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);}
+  var g=c.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);
+  var minX=Math.min.apply(null,p.xs),maxX=Math.max.apply(null,p.xs),minY=Math.min.apply(null,p.ys),maxY=Math.max.apply(null,p.ys);
+  var d=S.drag;
+  p.ys.forEach(function(f,i){
+    var y=f*h,on=d&&d.p===p&&d.t==="h"&&d.i===i;
+    g.lineWidth=on?2.4:1.4;g.strokeStyle=on?"#FFD54A":"rgba(255,255,255,0.85)";
+    g.beginPath();g.moveTo(minX*w,y);g.lineTo(maxX*w,y);g.stroke();
+    g.fillStyle=on?"#FFD54A":"#1B6B73";g.strokeStyle="#fff";g.lineWidth=1.5;
+    g.beginPath();g.arc(clamp(minX*w-0,8,w-8),y,5,0,6.2832);g.fill();g.stroke();
+  });
+  p.xs.forEach(function(f,i){
+    var x=f*w,on=d&&d.p===p&&d.t==="v"&&d.i===i;
+    g.lineWidth=on?2.4:1.4;g.strokeStyle=on?"#FFD54A":"rgba(255,255,255,0.85)";
+    g.beginPath();g.moveTo(x,minY*h);g.lineTo(x,maxY*h);g.stroke();
+    g.fillStyle=on?"#FFD54A":"#1B6B73";g.strokeStyle="#fff";g.lineWidth=1.5;
+    g.beginPath();g.arc(x,clamp(minY*h-0,8,h-8),5,0,6.2832);g.fill();g.stroke();
+  });
+}
+function drawAll(){S.panels.forEach(draw);}
+
+function rel(p,cx,cy){var r=p.canvas.getBoundingClientRect();return {x:cx-r.left,y:cy-r.top,w:r.width,h:r.height};}
+function hit(p,pt){
+  var xs=p.xs,ys=p.ys,w=pt.w,h=pt.h;
+  var minX=Math.min.apply(null,xs),maxX=Math.max.apply(null,xs),minY=Math.min.apply(null,ys),maxY=Math.max.apply(null,ys);
+  var spX=(maxX-minX)*w/Math.max(xs.length-1,1),spY=(maxY-minY)*h/Math.max(ys.length-1,1);
+  var thrX=Math.max(8,Math.min(24,spX*0.5)),thrY=Math.max(8,Math.min(24,spY*0.5));
+  var bh=null,bv=null,dh=1e9,dv=1e9,m=24;
+  if(pt.x>=minX*w-m&&pt.x<=maxX*w+m){ys.forEach(function(f,i){var d=Math.abs(pt.y-f*h);if(d<thrY&&d<dh){dh=d;bh=i;}});}
+  if(pt.y>=minY*h-m&&pt.y<=maxY*h+m){xs.forEach(function(f,i){var d=Math.abs(pt.x-f*w);if(d<thrX&&d<dv){dv=d;bv=i;}});}
+  return {h:bh,v:bv};
+}
+function beginDrag(p,pt){
+  if(locked())return false;
+  if(moveAll()){S.drag={p:p,t:"all",lx:pt.x,ly:pt.y,moved:false};drawAll();return true;}
+  var c=hit(p,pt);
+  if(c.h===null&&c.v===null)return false;
+  if(c.h!==null&&c.v!==null){S.drag={p:p,t:"pending",hi:c.h,vi:c.v,sx:pt.x,sy:pt.y,moved:false};}
+  else if(c.h!==null){S.drag={p:p,t:"h",i:c.h,moved:false};}
+  else{S.drag={p:p,t:"v",i:c.v,moved:false};}
+  drawAll();return true;
+}
+function targets(){return syncOn()?gridPanels():[S.drag.p];}
+function moveDrag(pt){
+  var d=S.drag;if(!d)return;
+  if(d.t==="pending"){
+    var ax=pt.x-d.sx,ay=pt.y-d.sy;
+    if(Math.max(Math.abs(ax),Math.abs(ay))<3)return;
+    if(Math.abs(ay)>=Math.abs(ax)){d.t="h";d.i=d.hi;}else{d.t="v";d.i=d.vi;}
+  }
+  d.moved=true;
+  if(d.t==="h"||d.t==="v"){
+    var key=d.t==="h"?"ys":"xs",f=clamp(d.t==="h"?pt.y/pt.h:pt.x/pt.w,0,1);
+    targets().forEach(function(q){q[key][d.i]=f;});
+  }else{
+    var dx=(pt.x-d.lx)/pt.w,dy=(pt.y-d.ly)/pt.h;d.lx=pt.x;d.ly=pt.y;
+    var p=d.p;
+    dx=clamp(dx,-Math.min.apply(null,p.xs),1-Math.max.apply(null,p.xs));
+    dy=clamp(dy,-Math.min.apply(null,p.ys),1-Math.max.apply(null,p.ys));
+    targets().forEach(function(q){q.xs=q.xs.map(function(v){return clamp(v+dx,0,1);});q.ys=q.ys.map(function(v){return clamp(v+dy,0,1);});});
+  }
+  drawAll();
+}
+function rnd(a){return a.map(function(v){return Math.round(v*10000)/10000;});}
+function sendValue(){
+  var gp=gridPanels(),v={};
+  if(gp[0])v.before={xs:rnd(gp[0].xs),ys:rnd(gp[0].ys)};
+  if(gp[1])v.after={xs:rnd(gp[1].xs),ys:rnd(gp[1].ys)};
+  send("streamlit:setComponentValue",{value:v,dataType:"json"});
+}
+function endDrag(){if(S.drag){var mv=S.drag.moved;S.drag=null;drawAll();if(mv)sendValue();}}
+
+function attach(p){
+  var c=p.canvas;
+  c.addEventListener("pointerdown",function(e){
+    if(e.pointerType==="touch")return;
+    if(beginDrag(p,rel(p,e.clientX,e.clientY))){try{c.setPointerCapture(e.pointerId);}catch(x){}e.preventDefault();}
+  });
+  c.addEventListener("pointermove",function(e){
+    if(e.pointerType==="touch")return;
+    var pt=rel(p,e.clientX,e.clientY);
+    if(S.drag&&S.drag.p===p){moveDrag(pt);return;}
+    if(locked()){c.style.cursor="default";return;}
+    if(moveAll()){c.style.cursor="move";return;}
+    var h=hit(p,pt);c.style.cursor=(h.h!==null&&h.v!==null)?"move":(h.h!==null?"ns-resize":(h.v!==null?"ew-resize":"default"));
+  });
+  c.addEventListener("pointerup",function(e){if(e.pointerType!=="touch")endDrag();});
+  c.addEventListener("pointercancel",function(e){if(e.pointerType!=="touch")endDrag();});
+  c.addEventListener("touchstart",function(e){
+    if(e.touches.length!==1)return;
+    var t=e.touches[0];
+    if(beginDrag(p,rel(p,t.clientX,t.clientY))&&e.cancelable)e.preventDefault();
+  },{passive:false});
+  c.addEventListener("touchmove",function(e){
+    if(S.drag&&S.drag.p===p){var t=e.touches[0];moveDrag(rel(p,t.clientX,t.clientY));if(e.cancelable)e.preventDefault();}
+  },{passive:false});
+  c.addEventListener("touchend",endDrag);
+  c.addEventListener("touchcancel",endDrag);
+}
+
+function build(a){
+  S.uid=a.uid;S.init=a.init;S.drag=null;
+  var cont=$("panels");cont.innerHTML="";
+  S.panels=(a.images||[]).map(function(src,i){
+    var p={src:src,grid:a.grid?!!a.grid[i]:true,xs:a.init.xs.slice(),ys:a.init.ys.slice()};
+    var panel=document.createElement("div");panel.className="panel";
+    var wrap=document.createElement("div");wrap.className="wrap";
+    var img=new Image();img.draggable=false;img.alt="";
+    img.onload=function(){draw(p);setHeight();};
+    img.src=src;wrap.appendChild(img);
+    if(p.grid){var c=document.createElement("canvas");wrap.appendChild(c);p.canvas=c;attach(p);}
+    var cap=document.createElement("div");cap.className="cap";cap.textContent=(a.labels&&a.labels[i])||"";
+    panel.appendChild(wrap);panel.appendChild(cap);cont.appendChild(panel);
+    return p;
+  });
+  setHeight();
+}
+$("reset").addEventListener("click",function(){
+  S.panels.forEach(function(p){if(p.grid){p.xs=S.init.xs.slice();p.ys=S.init.ys.slice();}});
+  drawAll();sendValue();
+});
+window.addEventListener("resize",function(){drawAll();setHeight();});
+window.addEventListener("message",function(ev){
+  var d=ev.data;if(!d||d.type!=="streamlit:render")return;
+  var a=d.args||{};
+  $("bar").style.display=(a.toolbar===false)?"none":"flex";
+  if(a.uid!==S.uid)build(a);else setHeight();
+});
+send("streamlit:componentReady",{apiVersion:1});
+})();
+</script></body></html>'''
+
+
+@_cache_resource
+def _grid_component():
+    import streamlit.components.v1 as components
+    d = os.path.join(tempfile.gettempdir(), "skin_grid_component_v1")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "index.html")
+    if not os.path.exists(p) or open(p, encoding="utf-8").read() != GRID_HTML:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(GRID_HTML)
+    return components.declare_component("skin_grid", path=d)
+
+
+def to_data_uri(rgb, max_side=900, quality=88) -> str:
+    h, w = rgb.shape[:2]
+    if max(h, w) > max_side:
+        k = max_side / max(h, w)
+        rgb = cv2.resize(rgb, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return "data:image/jpeg;base64," + base64.b64encode(buf).decode()
+
+
+def valid_grid(g, auto):
+    """Return g if it looks like a grid with the same line counts as auto, else auto."""
+    try:
+        xs, ys = [float(v) for v in g["xs"]], [float(v) for v in g["ys"]]
+        if len(xs) == len(auto["xs"]) and len(ys) == len(auto["ys"]):
+            return {"xs": xs, "ys": ys}
+    except Exception:
+        pass
+    return auto
 
 
 # ----------------------------------------------------------------------------
@@ -1068,10 +1291,12 @@ def main():
                 "Red line: face contour detected in the 1st photo. Green line: contour in the 2nd photo, "
                 "aligned to the 1st. Shaded area: the difference along the jawline.")
         with st.container(key="ops_lift"):
-            k1, k2, k3 = st.columns(3)
+            k1, k2, k3, k4 = st.columns(4)
             show_grid = k1.checkbox("Grid lines", value=True)
             cells = k2.slider("Grid density", 6, 20, 12)
             show_diff = k3.checkbox("Shade the difference", value=True)
+            draggable = k4.checkbox("Drag the grid", value=True,
+                                    help="Move grid lines with a finger or mouse. Untick for a fixed grid.")
 
         try:
             lm1 = face_landmarks(rgb)
@@ -1091,26 +1316,59 @@ def main():
                                "photo gives a more reliable contour.")
                 if rgb2 is not None and lm2 is None:
                     st.warning("No face contour could be detected in the 2nd photo. Showing the 1st photo only.")
-                views = contour_views(rgb, lm1, rgb2, lm2, show_grid, cells, show_diff)
+                views = contour_views(rgb, lm1, rgb2, lm2, show_diff, cells)
                 m = views["metrics"]
+                auto = views["grid"]
+
+                images = [views["before"]]
+                labels = ["1st photo: contour in red"]
+                grid_flags = [True]
+                if m is not None:
+                    images += [views["after"], views["overlay"]]
+                    labels += ["2nd photo (aligned): contour in green", "Both contours, difference shaded"]
+                    grid_flags += [True, False]
+
+                grid_val = None
+                if show_grid and draggable:
+                    try:
+                        hh = hashlib.md5(f"{cells}|{show_diff}".encode())
+                        for im in images:
+                            hh.update(np.ascontiguousarray(im).tobytes())
+                        uid = hh.hexdigest()[:12]
+                        grid_val = _grid_component()(
+                            images=[to_data_uri(im) for im in images], labels=labels, grid=grid_flags,
+                            init=auto, toolbar=not present, uid=uid, key=f"skin_grid_{uid}", default=None)
+                    except Exception as e:
+                        st.warning("The draggable grid could not be shown, so a fixed grid is used instead.")
+                        with st.expander("Technical details (send this to your developer)"):
+                            st.code(f"{type(e).__name__}: {e}"[:700])
+                        draggable = False
+                if not (show_grid and draggable):
+                    cols = st.columns(len(images))
+                    for col, im, lb, gf in zip(cols, images, labels, grid_flags):
+                        col.image(apply_grid(im, auto["xs"], auto["ys"]) if (show_grid and gf) else im,
+                                  caption=lb, use_container_width=True)
+
+                # Grid positions used for the PDF: what the user dragged, else the automatic grid
+                gv = grid_val if isinstance(grid_val, dict) else {}
+                g_before = valid_grid(gv.get("before"), auto)
+                g_after = valid_grid(gv.get("after"), auto)
+
+                def pdf_img(im, g):
+                    return apply_grid(im, g["xs"], g["ys"]) if show_grid else im
+
                 if m is None:
-                    st.image(views["before"], caption="1st photo: detected face contour (red)", width=380)
                     if rgb2 is None:
                         st.info("Add a 2nd photo above to compare the contours.")
-                    lift = {"before": views["before"], "after": None}
+                    lift = {"before": pdf_img(views["before"], g_before), "after": None}
                 else:
-                    ic1, ic2, ic3 = st.columns(3)
-                    ic1.image(views["before"], caption="1st photo: contour in red", use_container_width=True)
-                    ic2.image(views["after"], caption="2nd photo (aligned): contour in green",
-                              use_container_width=True)
-                    ic3.image(views["overlay"], caption="Both contours, difference shaded",
-                              use_container_width=True)
                     lines = metrics_lines(m)
                     st.markdown("".join(f'<span class="chip">{html.escape(t_)}</span> ' for t_ in lines),
                                 unsafe_allow_html=True)
                     for n_ in m["notes"]:
                         st.warning(n_)
-                    lift = {"before": views["before"], "after": views["after"],
+                    lift = {"before": pdf_img(views["before"], g_before),
+                            "after": pdf_img(views["after"], g_after),
                             "overlay": views["overlay"], "lines": lines, "notes": m["notes"]}
         st.caption("Contours are detected automatically and are approximate. Differences can come from head "
                    "angle, expression, lighting and camera distance, not only from treatment. "
