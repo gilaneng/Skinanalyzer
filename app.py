@@ -63,7 +63,7 @@ PRODUCTS = {
     },
 }
 
-APP_VERSION = "2026-11-25 draggable grid"
+APP_VERSION = "2026-11-25 draggable grid + numbers"
 CONCERN_THRESHOLD = 35  # score at/above which a concern is flagged
 
 
@@ -638,9 +638,33 @@ def smooth_closed(pts, n=8):
     return np.array(out, np.float32)
 
 
-def apply_grid(img, xs, ys):
+def _ranks(vals):
+    """1..N rank of each value, smallest first (top to bottom, or left to right)."""
+    order = np.argsort(vals)
+    r = np.empty(len(vals), dtype=int)
+    r[order] = np.arange(1, len(vals) + 1)
+    return r
+
+
+def _badge(img, text, cx, cy, scale):
+    """Teal number badge with white text, kept inside the image."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, scale, 1)
+    pad = max(2, int(scale * 5))
+    bw, bh = tw + 2 * pad, th + 2 * pad
+    H, W = img.shape[:2]
+    x0 = int(np.clip(cx - bw / 2, 0, W - bw - 1))
+    y0 = int(np.clip(cy - bh / 2, 0, H - bh - 1))
+    cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (27, 107, 115), -1)
+    cv2.putText(img, text, (x0 + pad, y0 + bh - pad), font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+    return bw, bh
+
+
+def apply_grid(img, xs, ys, numbers=True):
     """Draw grid lines at fractional positions (xs across, ys down). The grid spans from the
-    first to the last line in each direction, so moving the outer lines resizes the grid."""
+    first to the last line in each direction, so moving the outer lines resizes the grid.
+    With numbers=True, horizontal lines are numbered 1..N from top to bottom (left edge) and
+    vertical lines 1..N from left to right (top edge)."""
     if not xs or not ys:
         return img
     h, w = img.shape[:2]
@@ -654,7 +678,25 @@ def apply_grid(img, xs, ys):
     for f in xs:
         x = int(f * w)
         cv2.line(layer, (x, y0), (x, y1), (255, 255, 255), th, cv2.LINE_AA)
-    return cv2.addWeighted(layer, 0.6, img, 0.4, 0)
+    out = cv2.addWeighted(layer, 0.6, img, 0.4, 0)
+    if numbers:
+        scale = max(0.38, w / 1000)
+        ry, rx = _ranks(ys), _ranks(xs)
+        (tw, thh), _ = cv2.getTextSize("88", cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        bw_est, bh_est = tw + 2 * max(2, int(scale * 5)), thh + 2 * max(2, int(scale * 5))
+        crowd_x = (x1 - x0) / max(len(xs) - 1, 1) < bw_est + 2
+        crowd_y = (y1 - y0) / max(len(ys) - 1, 1) < bh_est + 2
+        for f, k in zip(ys, ry):
+            cx = x0 - 6 - bw_est / 2 - ((bw_est + 2) if (crowd_y and k % 2 == 0) else 0)
+            if cx - bw_est / 2 < 0:
+                cx = x0 + 6 + bw_est / 2
+            _badge(out, str(int(k)), cx, f * h, scale)
+        for f, k in zip(xs, rx):
+            cy = y0 - 6 - bh_est / 2 - ((bh_est + 2) if (crowd_x and k % 2 == 0) else 0)
+            if cy - bh_est / 2 < 0:
+                cy = y0 + 6 + bh_est / 2
+            _badge(out, str(int(k)), f * w, cy, scale)
+    return out
 
 
 def draw_contour(img, pts, color, th):
@@ -748,7 +790,7 @@ html,body{margin:0;padding:0;background:transparent;font-family:system-ui,-apple
 </div>
 <script>
 (function(){
-var S={uid:null,panels:[],init:null,drag:null,lastH:0};
+var S={uid:null,panels:[],init:null,drag:null,lastH:0,numbers:true};
 function $(id){return document.getElementById(id);}
 function send(type,data){var m={isStreamlitMessage:true,type:type};for(var k in data){m[k]=data[k];}window.parent.postMessage(m,"*");}
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
@@ -758,6 +800,33 @@ function locked(){return $("lock").checked;}
 function moveAll(){return $("moveall").checked;}
 function syncOn(){return $("sync").checked;}
 
+function ranks(arr){var idx=arr.map(function(v,i){return i;}).sort(function(a,b){return arr[a]-arr[b];});var r=[];idx.forEach(function(i,k){r[i]=k+1;});return r;}
+function badgeBox(g,cx,cy,bw,bh,text,on){
+  var x=cx-bw/2,y=cy-bh/2,r=4;
+  g.beginPath();g.moveTo(x+r,y);g.lineTo(x+bw-r,y);g.quadraticCurveTo(x+bw,y,x+bw,y+r);g.lineTo(x+bw,y+bh-r);
+  g.quadraticCurveTo(x+bw,y+bh,x+bw-r,y+bh);g.lineTo(x+r,y+bh);g.quadraticCurveTo(x,y+bh,x,y+bh-r);g.lineTo(x,y+r);g.quadraticCurveTo(x,y,x+r,y);g.closePath();
+  g.fillStyle=on?"#FFD54A":"#1B6B73";g.fill();
+  g.fillStyle=on?"#14272E":"#FFFFFF";g.fillText(text,cx,cy+0.5);
+}
+function drawNumbers(g,p,w,h,minX,maxX,minY,maxY){
+  var fs=clamp(Math.round(w/34),9,13),ry=ranks(p.ys),rx=ranks(p.xs),d=S.drag;
+  g.font="bold "+fs+"px system-ui,-apple-system,sans-serif";g.textAlign="center";g.textBaseline="middle";
+  var bh=fs+6,bwMax=g.measureText("88").width+7;
+  var spX=(maxX-minX)*w/Math.max(p.xs.length-1,1),spY=(maxY-minY)*h/Math.max(p.ys.length-1,1);
+  var crowdX=spX<bwMax+2,crowdY=spY<bh+2;
+  p.ys.forEach(function(f,i){
+    var t=String(ry[i]),bw=g.measureText(t).width+7,on=d&&d.p===p&&d.t==="h"&&d.i===i;
+    var cx=minX*w-9-bw/2-((crowdY&&ry[i]%2===0)?(bw+2):0);
+    if(cx-bw/2<1)cx=minX*w+9+bw/2;
+    badgeBox(g,cx,f*h,bw,bh,t,on);
+  });
+  p.xs.forEach(function(f,i){
+    var t=String(rx[i]),bw=g.measureText(t).width+7,on=d&&d.p===p&&d.t==="v"&&d.i===i;
+    var cy=minY*h-9-bh/2-((crowdX&&rx[i]%2===0)?(bh+2):0);
+    if(cy-bh/2<1)cy=minY*h+9+bh/2;
+    badgeBox(g,f*w,cy,bw,bh,t,on);
+  });
+}
 function draw(p){
   if(!p.grid||!p.canvas)return;
   var c=p.canvas,w=c.clientWidth,h=c.clientHeight;if(!w||!h)return;
@@ -780,6 +849,7 @@ function draw(p){
     g.fillStyle=on?"#FFD54A":"#1B6B73";g.strokeStyle="#fff";g.lineWidth=1.5;
     g.beginPath();g.arc(x,clamp(minY*h-0,8,h-8),5,0,6.2832);g.fill();g.stroke();
   });
+  if(S.numbers)drawNumbers(g,p,w,h,minX,maxX,minY,maxY);
 }
 function drawAll(){S.panels.forEach(draw);}
 
@@ -888,7 +958,8 @@ window.addEventListener("message",function(ev){
   var d=ev.data;if(!d||d.type!=="streamlit:render")return;
   var a=d.args||{};
   $("bar").style.display=(a.toolbar===false)?"none":"flex";
-  if(a.uid!==S.uid)build(a);else setHeight();
+  S.numbers=(a.numbers!==false);
+  if(a.uid!==S.uid)build(a);else{drawAll();setHeight();}
 });
 send("streamlit:componentReady",{apiVersion:1});
 })();
@@ -1291,11 +1362,13 @@ def main():
                 "Red line: face contour detected in the 1st photo. Green line: contour in the 2nd photo, "
                 "aligned to the 1st. Shaded area: the difference along the jawline.")
         with st.container(key="ops_lift"):
-            k1, k2, k3, k4 = st.columns(4)
+            k1, k2, k3 = st.columns(3)
             show_grid = k1.checkbox("Grid lines", value=True)
             cells = k2.slider("Grid density", 6, 20, 12)
             show_diff = k3.checkbox("Shade the difference", value=True)
-            draggable = k4.checkbox("Drag the grid", value=True,
+            k4, k5, _k6 = st.columns(3)
+            show_numbers = k4.checkbox("Number the grid lines", value=True)
+            draggable = k5.checkbox("Drag the grid", value=True,
                                     help="Move grid lines with a finger or mouse. Untick for a fixed grid.")
 
         try:
@@ -1337,7 +1410,7 @@ def main():
                         uid = hh.hexdigest()[:12]
                         grid_val = _grid_component()(
                             images=[to_data_uri(im) for im in images], labels=labels, grid=grid_flags,
-                            init=auto, toolbar=not present, uid=uid, key=f"skin_grid_{uid}", default=None)
+                            init=auto, toolbar=not present, numbers=show_numbers, uid=uid, key=f"skin_grid_{uid}", default=None)
                     except Exception as e:
                         st.warning("The draggable grid could not be shown, so a fixed grid is used instead.")
                         with st.expander("Technical details (send this to your developer)"):
@@ -1346,7 +1419,7 @@ def main():
                 if not (show_grid and draggable):
                     cols = st.columns(len(images))
                     for col, im, lb, gf in zip(cols, images, labels, grid_flags):
-                        col.image(apply_grid(im, auto["xs"], auto["ys"]) if (show_grid and gf) else im,
+                        col.image(apply_grid(im, auto["xs"], auto["ys"], show_numbers) if (show_grid and gf) else im,
                                   caption=lb, use_container_width=True)
 
                 # Grid positions used for the PDF: what the user dragged, else the automatic grid
@@ -1355,7 +1428,7 @@ def main():
                 g_after = valid_grid(gv.get("after"), auto)
 
                 def pdf_img(im, g):
-                    return apply_grid(im, g["xs"], g["ys"]) if show_grid else im
+                    return apply_grid(im, g["xs"], g["ys"], show_numbers) if show_grid else im
 
                 if m is None:
                     if rgb2 is None:
@@ -1370,6 +1443,11 @@ def main():
                     lift = {"before": pdf_img(views["before"], g_before),
                             "after": pdf_img(views["after"], g_after),
                             "overlay": views["overlay"], "lines": lines, "notes": m["notes"]}
+        if show_grid and show_numbers:
+            n_lines = cells + 1
+            st.caption(f"Grid numbering: horizontal lines are numbered 1 to {n_lines} from the forehead down to "
+                       f"the chin, and vertical lines 1 to {n_lines} from the left of the photo to the right. "
+                       "Numbers follow the lines when you move them.")
         st.caption("Contours are detected automatically and are approximate. Differences can come from head "
                    "angle, expression, lighting and camera distance, not only from treatment. "
                    "This is not a medical measurement.")
